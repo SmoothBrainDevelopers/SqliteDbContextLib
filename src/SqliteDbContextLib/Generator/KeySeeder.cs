@@ -120,21 +120,62 @@ namespace SqliteDbContext.Generator
             if (meta == null) return;
 
             // Assign primary keys.
-            if(!allPrimaryKeysSet)
+            if (!allPrimaryKeysSet)
             {
-                foreach (var keyProp in meta.PrimaryKeys)
+                int maxAttempts = 1000;
+                int attempts = 0;
+                var set = _context.Set<T>();
+                var compositeKeyLambda = _dependencyResolver.GetCompositeKeyLambda<T>(meta.PrimaryKeys).Compile();
+
+                object[] GetKeyValues(T e) => compositeKeyLambda(e) as object[];
+
+                // Use BuildKeyEqualsLambda for optimized duplicate check
+                var keyPropJoined = string.Join(",", meta.PrimaryKeys);
+                var keyTypes = meta.PrimaryKeys.Select(k => typeof(T).GetProperty(k)?.PropertyType ?? typeof(object)).ToArray();
+                // For composite keys, propType is typeof(object[])
+                Type propType = keyTypes.Length == 1 ? keyTypes[0] : typeof(object[]);
+                var keyEquals = BuildKeyEqualsLambda<T>(keyPropJoined, propType);
+
+                // Replace the IsDuplicate() method in AssignKeys<T> with the following:
+
+                bool IsDuplicate()
                 {
-                    var propInfo = typeof(T).GetProperty(keyProp);
-                    if (propInfo != null && propInfo.CanWrite)
+                    var entityKeyValues = GetKeyValues(entity);
+                    if (keyTypes.Length == 1)
                     {
-                        object newKey = CustomKeyFetcher != null ? CustomKeyFetcher(typeof(T), keyProp)
-                                          : AutoIncrementKey(typeof(T), keyProp, propInfo.PropertyType);
-                        propInfo.SetValue(entity, newKey);
+                        // Single key: pass the value directly
+                        return set.AsEnumerable().Any(e => keyEquals(e, entityKeyValues[0]));
+                    }
+                    else
+                    {
+                        // Composite key: pass the object[] as expected
+                        return set.AsEnumerable().Any(e => keyEquals(e, entityKeyValues));
                     }
                 }
+
+                do
+                {
+                    // 1. Assign all primary key values (generate or fetch)
+                    // Re-generate all primary key values
+                    foreach (var keyProp in meta.PrimaryKeys)
+                    {
+                        var propInfo = typeof(T).GetProperty(keyProp);
+                        if (propInfo != null && propInfo.CanWrite)
+                        {
+                            object newKey = CustomKeyFetcher != null
+                                ? CustomKeyFetcher(typeof(T), keyProp)
+                                : AutoIncrementKey(typeof(T), keyProp, propInfo.PropertyType);
+                            propInfo.SetValue(entity, newKey);
+                        }
+                    }
+                    attempts++;
+                    if (attempts > maxAttempts)
+                        throw new InvalidOperationException($"Unable to generate unique composite key for {typeof(T).Name} after {maxAttempts} attempts.");
+                    // 2. Check for duplicate composite key
+                } while (IsDuplicate());
             }
 
-            if(allForeignKeysSet) return;
+            if (allForeignKeysSet) return;
 
             // Process foreign keys.
             foreach (var foreign in meta.ForeignKeys)
@@ -145,10 +186,11 @@ namespace SqliteDbContext.Generator
                     if (propInfo != null && propInfo.CanWrite)
                     {
                         // Find the dependent (principal) type for this foreign key.
-                        var foreignType = _context.Model.FindEntityType(typeof(T))
-                                            .GetForeignKeys()
-                                            .FirstOrDefault(fk => fk.Properties.Any(p => p.Name == fkProp))
-                                            ?.PrincipalEntityType.ClrType;
+                        var entityType = _context.Model.FindEntityType(typeof(T));
+                        var foreignType = entityType?
+                            .GetForeignKeys()
+                            .FirstOrDefault(fk => fk.Properties.Any(p => p.Name == fkProp))
+                            ?.PrincipalEntityType.ClrType;
                         if (foreignType != null && AllowExistingForeignKeys)
                         {
                             var set = GetQueryableForType(_context, foreignType);
@@ -185,6 +227,70 @@ namespace SqliteDbContext.Generator
                     }
                 }
             }
+        }
+
+        // Helper to build and cache the lambda for duplicate key checking
+        private static readonly ConcurrentDictionary<(Type, string, Type), Delegate> _keyEqualsLambdaCache = new();
+
+        // Return a lambda that takes both entity and value (supports composite keys: value is object[])
+        private static Func<T, object, bool> BuildKeyEqualsLambda<T>(string keyProp, Type propType)
+        {
+            var cacheKey = (typeof(T), keyProp, propType);
+            if (!_keyEqualsLambdaCache.TryGetValue(cacheKey, out var cachedLambda))
+            {
+                var parameter = Expression.Parameter(typeof(T), "e");
+                var valueParameter = Expression.Parameter(typeof(object), "val");
+
+                // Support composite keys: keyProp can be comma-separated property names
+                var keyProps = keyProp.Split(',').Select(p => p.Trim()).ToArray();
+                Expression comparison;
+
+                if (keyProps.Length == 1)
+                {
+                    // Single key
+                    var property = Expression.Property(parameter, keyProps[0]);
+                    Expression convertedValue;
+                    if (propType.IsValueType && Nullable.GetUnderlyingType(propType) == null)
+                    {
+                        convertedValue = Expression.Unbox(valueParameter, propType);
+                    }
+                    else
+                    {
+                        convertedValue = Expression.Convert(valueParameter, propType);
+                    }
+                    comparison = Expression.Equal(property, convertedValue);
+                }
+                else
+                {
+                    // Composite key: valueParameter is object[]
+                    var valueArray = Expression.Convert(valueParameter, typeof(object[]));
+                    var equals = new List<Expression>();
+                    for (int i = 0; i < keyProps.Length; i++)
+                    {
+                        var propInfo = typeof(T).GetProperty(keyProps[i]);
+                        var property = Expression.Property(parameter, keyProps[i]);
+                        var element = Expression.ArrayIndex(valueArray, Expression.Constant(i));
+                        Expression convertedElement;
+                        var type = propInfo.PropertyType;
+                        if (type.IsValueType && Nullable.GetUnderlyingType(type) == null)
+                        {
+                            convertedElement = Expression.Unbox(element, type);
+                        }
+                        else
+                        {
+                            convertedElement = Expression.Convert(element, type);
+                        }
+                        equals.Add(Expression.Equal(property, convertedElement));
+                    }
+                    comparison = equals.Aggregate(Expression.AndAlso);
+                }
+
+                var lambda = Expression.Lambda<Func<T, object, bool>>(comparison, parameter, valueParameter);
+                var compiled = lambda.Compile();
+                _keyEqualsLambdaCache[cacheKey] = compiled;
+                cachedLambda = compiled;
+            }
+            return (Func<T, object, bool>)cachedLambda;
         }
 
         /// <summary>
