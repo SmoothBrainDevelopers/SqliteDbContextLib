@@ -86,11 +86,12 @@ namespace SqliteDbContext.Context
             // Generate a fake entity and remove all navigation properties (initial cleanup).
             var entity = BogusGenerator.GenerateFake<TEntity>();
             entity = BogusGenerator.RemoveNavigationProperties(entity);
-            initAction?.Invoke(entity);
 
             // Clear key properties and assign keys (with recursion depth 0).
             KeySeeder.ClearKeyProperties(entity, 0);
-            KeySeeder.AssignKeys(entity, 0);
+            initAction?.Invoke(entity);
+            var (allPrimaryKeysSet, allForeignKeysSet) = AreAllKeysSet(entity);
+            KeySeeder.AssignKeys(entity, 0, allPrimaryKeysSet, allForeignKeysSet);
 
             // Attach the entity to the context.
             Set<TEntity>().Add(entity);
@@ -100,6 +101,67 @@ namespace SqliteDbContext.Context
 
             SaveChanges();
             return entity;
+        }
+
+        private (bool allPrimaryKeysSet, bool allForeignKeysSet) AreAllKeysSet<TEntity>(TEntity entity) where TEntity : class
+        {
+            var metadata = DependencyResolver.GetEntityMetadata().FirstOrDefault(em => em.EntityType == typeof(TEntity));
+            if (metadata == null)
+                return (false, false);
+
+            bool allPrimaryKeysSet = metadata.PrimaryKeys.Count > 0;
+            bool allForeignKeysSet = metadata.ForeignKeys.Count > 0;
+
+            foreach (var key in metadata.PrimaryKeys)
+            {
+                var prop = typeof(TEntity).GetProperty(key);
+                if(prop == null)
+                {
+                    allPrimaryKeysSet = false; break;
+                }
+                var value = prop.GetValue(entity);
+
+                if(IsDefaultOrEmpty(value, prop.PropertyType))
+                {
+                    allPrimaryKeysSet = false; break;
+                }
+            }
+            foreach (var fk in metadata.ForeignKeys)
+            {
+                foreach (var fkProp in fk.ForeignKeyProperties)
+                {
+                    var prop = typeof(TEntity).GetProperty(fkProp);
+                    if (prop == null)
+                    {
+                        allForeignKeysSet = false; break;
+                    }
+                    var value = prop.GetValue(entity);
+                    if (IsDefaultOrEmpty(value, prop.PropertyType))
+                    {
+                        allForeignKeysSet = false; break;
+                    }
+                }
+            }
+            return (allPrimaryKeysSet, allForeignKeysSet);
+        }
+
+        private static bool IsDefaultOrEmpty(object? value, Type type)
+        {
+            if(value == null) 
+                return true;
+            if (type.IsValueType)
+            {
+                return value.Equals(Activator.CreateInstance(type));
+            }
+            else if (type == typeof(string))
+            {
+                return string.IsNullOrEmpty(value as string);
+            }
+            else if(type == typeof(Guid))
+            {
+                return (Guid)value == Guid.Empty;
+            }
+            return false;
         }
 
         private string SerializeRecursiveEntity<TEntity>(TEntity entity) where TEntity : class

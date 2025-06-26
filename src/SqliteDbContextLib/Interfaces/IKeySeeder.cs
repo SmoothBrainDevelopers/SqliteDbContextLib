@@ -14,6 +14,6 @@ namespace SqliteDbContext.Interfaces
         public double ExistingReferenceChance { get; set; }
         public void ClearKeyProperties<T>(T entity, int recursionDepth = 0) where T : class;
         public void ClearNavigationReferences(object instance);
-        public void AssignKeys<T>(T entity, int recursionDepth = 0) where T : class;
+        public void AssignKeys<T>(T entity, int recursionDepth = 0, bool allPrimaryKeysSet = false, bool allForeignKeysSet = false) where T : class;
     }
 }

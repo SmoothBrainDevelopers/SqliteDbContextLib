@@ -48,7 +48,7 @@ namespace SqliteDbContext.Generator
         }
 
         /// <summary>
-        /// Clears primary key properties of the entity.
+        /// Clears primary key and foreign key properties of the entity.
         /// </summary>
         public void ClearKeyProperties<T>(T entity, int recursionDepth = 0) where T : class
         {
@@ -60,14 +60,29 @@ namespace SqliteDbContext.Generator
                 if (propInfo != null && propInfo.CanWrite)
                     propInfo.SetValue(entity, GetDefault(propInfo.PropertyType));
             }
+
+            if(meta.ForeignKeys != null)
+            {
+                foreach(var fk in meta.ForeignKeys)
+                {
+                    foreach(var fkProp in fk.ForeignKeyProperties)
+                    {
+                        var propInfo = typeof(T).GetProperty(fkProp);
+                        if (propInfo != null && propInfo.CanWrite)
+                            propInfo.SetValue(entity, GetDefault(propInfo.PropertyType));
+                    }
+                }
+            }
         }
 
         /// <summary>
         /// Clears virtual (non-collection) navigation properties by setting them to null.
         /// </summary>
         /// <param name="instance">The entity instance whose navigation properties should be cleared.</param>
-        public void ClearNavigationReferences(object instance)
+        public void ClearNavigationReferences(object? instance)
         {
+            if(instance == null) return;
+
             var type = instance.GetType();
             foreach (var prop in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))
             {
@@ -96,7 +111,7 @@ namespace SqliteDbContext.Generator
         /// Assigns primary and foreign keys to the entity.
         /// For foreign keys, if dependent instances exist, uses ExistingReferenceChance to decide whether to reuse or generate a new one.
         /// </summary>
-        public void AssignKeys<T>(T entity, int recursionDepth = 0) where T : class
+        public void AssignKeys<T>(T entity, int recursionDepth = 0, bool allPrimaryKeysSet = false, bool allForeignKeysSet = false) where T : class
         {
             if (recursionDepth >= MaxRecursionDepth)
                 throw new InvalidOperationException($"Maximum recursion depth reached for type {typeof(T).FullName}.");
@@ -105,16 +120,21 @@ namespace SqliteDbContext.Generator
             if (meta == null) return;
 
             // Assign primary keys.
-            foreach (var keyProp in meta.PrimaryKeys)
+            if(!allPrimaryKeysSet)
             {
-                var propInfo = typeof(T).GetProperty(keyProp);
-                if (propInfo != null && propInfo.CanWrite)
+                foreach (var keyProp in meta.PrimaryKeys)
                 {
-                    object newKey = CustomKeyFetcher != null ? CustomKeyFetcher(typeof(T), keyProp)
-                                      : AutoIncrementKey(typeof(T), keyProp, propInfo.PropertyType);
-                    propInfo.SetValue(entity, newKey);
+                    var propInfo = typeof(T).GetProperty(keyProp);
+                    if (propInfo != null && propInfo.CanWrite)
+                    {
+                        object newKey = CustomKeyFetcher != null ? CustomKeyFetcher(typeof(T), keyProp)
+                                          : AutoIncrementKey(typeof(T), keyProp, propInfo.PropertyType);
+                        propInfo.SetValue(entity, newKey);
+                    }
                 }
             }
+
+            if(allForeignKeysSet) return;
 
             // Process foreign keys.
             foreach (var foreign in meta.ForeignKeys)
@@ -185,7 +205,7 @@ namespace SqliteDbContext.Generator
             clearMethod.Invoke(this, new object[] { instance, recursionDepth });
             var assignMethod = GetType().GetMethod("AssignKeys", BindingFlags.Public | BindingFlags.Instance)
                                .MakeGenericMethod(entityType);
-            assignMethod.Invoke(this, new object[] { instance, recursionDepth });
+            assignMethod.Invoke(this, new object[] { instance, recursionDepth, false, false });
             // Add the instance to the context.
             var setMethod = typeof(DbContext).GetMethod("Set", Type.EmptyTypes).MakeGenericMethod(entityType);
             var dbSet = setMethod.Invoke(_context, null);
